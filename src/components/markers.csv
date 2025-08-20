@@ -1,0 +1,4 @@
+timestamp,side,color,label
+1755612000000,up,#00b96b,Entry
+1755612300000,down,#ff4d4f,Stop
+1755612600000,up,#ffaa00,TakeProfit

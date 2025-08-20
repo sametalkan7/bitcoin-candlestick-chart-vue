@@ -6,30 +6,49 @@
       @set-mode="setMode"
       @undo="undoDraw"
       @clear="clearDraw"
+      @markers-csv-loaded="onMarkersCsvLoaded"
+      @clear-markers="onClearMarkers"
     />
 
-    <!-- Grafik -->
-    <trading-vue
-      ref="tv"
-      v-if="tv"
-      :data="tv"
-      :overlays="[DrawOverlay]"
-      :toolbar="true"
-      :width="w"
-      :height="h"
-      :title-txt="'BTCUSDT'"
-      @click.native="onChartClick"
-    />
+    <!-- Chart + durum -->
+    <div class="chart-wrap" style="position:relative">
+      <trading-vue
+        v-if="tv"
+        ref="tv"
+        :data="tv"
+        :overlays="[DrawOverlay]"
+        :toolbar="true"
+        :width="w"
+        :height="h"
+        :title-txt="'BTCUSDT'"
+        @click.native="onChartClick"
+      />
+      <div v-else style="color:#8fa3b8; padding:16px">
+        Yükleniyor…
+      </div>
 
-    <div v-else style="color:#8fa3b8; padding:16px">Yükleniyor…</div>
+      <!-- CSV timestamp marker overlay canvas -->
+      <canvas
+        v-if="tv"
+        ref="overlayMarkers"
+        style="position:absolute; inset:0; pointer-events:none; z-index 10;"
+      ></canvas>
+    </div>
   </div>
 </template>
+
 
 <script>
 import axios from 'axios'
 import TradingVue from 'trading-vue-js'
 import Toolbar from './components/Toolbar.vue'
-import DrawOverlay from './overlays/DrawOverlay.js'
+import DrawOverlay from './Overlays/DrawOverlay.js'
+
+// === CSV timestamp marker overlay ===
+import {
+  createMarkersOverlay,
+  parseMarkersCsv
+} from './Overlays/MarkersOverlay'
 
 // Binance ms verir, TradingVue ms kullanır -> /1000 yok
 function mapBinanceToTV (klines) {
@@ -55,7 +74,9 @@ export default {
         vlines: []           // vlines:     [ [time], ... ]
       },
 
-      // template'te :overlays="[DrawOverlay]" için expose ediyoruz
+      // overlay referansları
+      markersOverlay: null,
+      intervalMs: 5 * 60 * 1000, // 5m; aktif intervale göre güncelle
       DrawOverlay
     }
   },
@@ -66,6 +87,7 @@ export default {
   },
   beforeDestroy () {
     window.removeEventListener('resize', this.onResize)
+    if (this._overlayRO) this._overlayRO.disconnect()
   },
 
   methods: {
@@ -74,6 +96,11 @@ export default {
     onResize () {
       this.w = window.innerWidth
       this.h = window.innerHeight
+      // chart boyutu değişince markers overlay’i de yeniden çiz
+      this.$nextTick(() => {
+        this.markersOverlay && this.markersOverlay.resize()
+        this.markersOverlay && this.markersOverlay.onViewportChange()
+      })
     },
 
     async loadData () {
@@ -89,14 +116,102 @@ export default {
         ],
         offchart: []
       }
+
+      // TradingVue mount edildikten sonra markers overlay’i kur
+      this.$nextTick(() => {
+        this.initMarkersOverlay()
+        // TV set edildikten SONRA:
+this.$nextTick(() => {
+  this.initMarkersOverlay();
+
+  // Grafik verisinden ortadaki candle'ın openTime'ını al
+  const arr = this.tv && this.tv.chart && this.tv.chart.data || [];
+  if (arr.length) {
+    const mid = Math.floor(arr.length / 2);
+    const ts  = arr[mid][0];         // openTime (ms)
+    // DEBUG: tek bir marker koy
+    this.markersOverlay.setMarkers([
+      { ts, side: 'up', color: '#ff0', label: 'debug' }
+    ]);
+    this.markersOverlay.onViewportChange();
+  }
+});
+
+        // ilk çizim
+        this.markersOverlay && this.markersOverlay.onViewportChange()
+      })
     },
 
-    onChartClick (ev) {
-      // TradingVue chart helper
+    // TradingVue chart helper ($p) erişimi
+    getChartP () {
       const chartRef =
         (this.$refs.tv && this.$refs.tv.$refs && this.$refs.tv.$refs.chart) ||
         (this.$refs.tv && this.$refs.tv.$children && this.$refs.tv.$children[0])
-      const $p = chartRef && chartRef.$p
+      return chartRef && chartRef.$p
+    },
+
+initMarkersOverlay () {
+  if (this.markersOverlay) return
+  const canvas = this.$refs.overlayMarkers
+  const $p = this.getChartP()
+  if (!canvas || !$p) return
+
+  // 🔧 PROJEKSİYON FALLBACK
+const getXForTime = (ms) => {
+  const $p = this.getChartP();
+  if ($p.x2screen) return $p.x2screen(ms);
+  if ($p.t2screen) return $p.t2screen(ms);
+  if ($p.t2x)      return $p.t2x(ms);
+  const arr = (this.tv?.chart?.data) || [];
+  let lo=0, hi=arr.length-1, idx=-1;
+  while (lo<=hi) { const mid=(lo+hi)>>>1;
+    if (arr[mid][0]===ms) { idx=mid; break; }
+    arr[mid][0] < ms ? (lo=mid+1) : (hi=mid-1);
+  }
+  if (idx<0) idx=Math.max(0, Math.min(arr.length-1, lo));
+  return $p.i2x ? $p.i2x(idx) : (20 + idx*6);
+};
+const getYForPrice = (p) => {
+  const $p = this.getChartP();
+  if ($p.y2screen) return $p.y2screen(p);
+  if ($p.p2screen) return $p.p2screen(p);
+  if ($p.p2y)      return $p.p2y(p);
+  return 40;
+};
+
+
+  this.markersOverlay = createMarkersOverlay({
+    canvas,
+    getXForTime,
+    getYForPrice,
+    getCandles: () => {
+      const arr = (this.tv && this.tv.chart && this.tv.chart.data) || []
+      return arr.map(row => ({
+        openTime: row[0],
+        open: row[1],
+        high: row[2],
+        low:  row[3],
+        close:row[4]
+      }))
+    },
+    intervalMs: this.intervalMs, // 5m = 300000
+    yPlacement: 'high'
+  })
+
+  const ro = new ResizeObserver(() => {
+    this.markersOverlay?.resize()
+    this.markersOverlay?.onViewportChange()
+  })
+  ro.observe(canvas)
+  this._overlayRO = ro
+
+  // ilk çizimi zorla
+  this.markersOverlay.resize()
+  this.markersOverlay.onViewportChange()
+},
+
+    onChartClick (ev) {
+      const $p = this.getChartP()
       if (!$p) return
 
       const t = $p.screen2x(ev.offsetX)   // time (ms)
@@ -104,11 +219,13 @@ export default {
 
       if (this.drawMode === 'hline') {
         this.drawData.hlines.push([p])
-        return this.refreshOverlay()
+        this.refreshOverlay()
+        return this.notifyMarkersRedraw()
       }
       if (this.drawMode === 'vline') {
         this.drawData.vlines.push([t])
-        return this.refreshOverlay()
+        this.refreshOverlay()
+        return this.notifyMarkersRedraw()
       }
       if (this.drawMode === 'ray') {
         if (!this.pendingPoint) this.pendingPoint = [t, p]
@@ -116,7 +233,8 @@ export default {
           const [t1, p1] = this.pendingPoint
           this.drawData.rays.push([t1, p1, t, p])
           this.pendingPoint = null
-          return this.refreshOverlay()
+          this.refreshOverlay()
+          return this.notifyMarkersRedraw()
         }
       }
       if (this.drawMode === 'trend') {
@@ -125,7 +243,8 @@ export default {
           const [t1, p1] = this.pendingPoint
           this.drawData.segments.push([t1, p1, t, p])
           this.pendingPoint = null
-          return this.refreshOverlay()
+          this.refreshOverlay()
+          return this.notifyMarkersRedraw()
         }
       }
     },
@@ -137,6 +256,7 @@ export default {
       else if (this.drawMode === 'ray'   && d.rays.length)   d.rays.pop()
       else if (this.drawMode === 'trend' && d.segments.length) d.segments.pop()
       this.refreshOverlay()
+      this.notifyMarkersRedraw()
     },
 
     clearDraw () {
@@ -145,10 +265,11 @@ export default {
       this.drawData.hlines = []
       this.drawData.vlines = []
       this.refreshOverlay()
+      this.notifyMarkersRedraw()
     },
 
     refreshOverlay () {
-      // referans değiştirerek yeniden çizdir
+      // referans değiştirerek yeniden çizdir (DrawOverlay için)
       this.tv = {
         ...this.tv,
         onchart: [
@@ -160,6 +281,25 @@ export default {
           }}
         ]
       }
+    },
+
+    notifyMarkersRedraw () {
+      // zoom/pan veya overlay değişimlerinde marker’ları da güncelle
+      this.$nextTick(() => {
+        this.markersOverlay && this.markersOverlay.onViewportChange()
+      })
+    },
+
+    // === CSV Marker akışı ===
+    onMarkersCsvLoaded (csvText) {
+      const list = parseMarkersCsv(csvText)
+      console.log('[markers] parsed', list.length, list.slice(0,3))
+      if (!this.markersOverlay) this.initMarkersOverlay()
+      this.markersOverlay && this.markersOverlay.setMarkers(list)
+      this.markersOverlay && this.markersOverlay.onViewportChange()
+},
+    onClearMarkers () {
+      this.markersOverlay && this.markersOverlay.setMarkers([])
     }
   }
 }
